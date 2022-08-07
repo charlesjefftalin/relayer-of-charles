@@ -1,1 +1,17 @@
-
+{
+          type: cosmos
+        value:
+            key: gaia-rly
+            chain-id: GAIA
+            rpc-addr: http://185.249.225.35:23657
+            grpc-addr: http://185.249.225.35:23661
+            account-prefix: cosmos
+            keyring-backend: test
+            gas-adjustment: 1.2
+            gas-prices: 0.0025uatom
+            debug: true
+            timeout: 300s
+            output-format: json
+            sign-mode: direct
+            memo-prefix: dzungpham1987#5184
+}
