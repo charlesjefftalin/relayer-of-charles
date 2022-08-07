@@ -6,7 +6,7 @@
             "rpc-addr": "http://185.249.225.35:23657"
             "grpc-addr": "http://185.249.225.35:23661"
             "account-prefix": "cosmos"
-            "keyring-backend": "test""
+            "keyring-backend": "test"
             "gas-adjustment": 1.2,
             "gas-prices": "0.0025uatom"
             "debug": "true"
