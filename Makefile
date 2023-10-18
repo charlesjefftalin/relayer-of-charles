@@ -1,9 +1,11 @@
 VERSION := $(shell echo $(shell git describe --tags) | sed 's/^v//')
 COMMIT  := $(shell git log -1 --format='%H')
+DIRTY := $(shell git status --porcelain | wc -l | xargs)
 GAIA_VERSION := v7.0.1
 AKASH_VERSION := v0.16.3
 OSMOSIS_VERSION := v8.0.0
 WASMD_VERSION := v0.25.0
+DOCKER := $(shell which docker)
 
 GOPATH := $(shell go env GOPATH)
 GOBIN := $(GOPATH)/bin
@@ -14,9 +16,14 @@ all: lint install
 # Build / Install
 ###############################################################################
 
-LD_FLAGS = -X github.com/cosmos/relayer/v2/cmd.Version=$(VERSION)
+ldflags = -X github.com/cosmos/relayer/v2/cmd.Version=$(VERSION) \
+					-X github.com/cosmos/relayer/v2/cmd.Commit=$(COMMIT) \
+					-X github.com/cosmos/relayer/v2/cmd.Dirty=$(DIRTY)
 
-BUILD_FLAGS := -ldflags '$(LD_FLAGS)'
+ldflags += $(LDFLAGS)
+ldflags := $(strip $(ldflags))
+
+BUILD_FLAGS := -ldflags '$(ldflags)'
 
 build: go.sum
 ifeq ($(OS),Windows_NT)
@@ -24,7 +31,7 @@ ifeq ($(OS),Windows_NT)
 	@go build -mod=readonly $(BUILD_FLAGS) -o build/rly.exe main.go
 else
 	@echo "building rly binary..."
-	@go build -mod=readonly $(BUILD_FLAGS) -o build/rly main.go
+	@go build  $(BUILD_FLAGS) -o build/rly main.go
 endif
 
 build-zip: go.sum
@@ -54,29 +61,38 @@ build-osmosis-docker:
 test:
 	@go test -mod=readonly -race ./...
 
-test-integration:
-	@go test -mod=readonly -v -timeout 20m ./_test/
+interchaintest:
+	cd interchaintest && go test -race -v -run TestRelayerInProcess .
 
-test-gaia:
-	@go test -mod=readonly -v -run 'TestGaiaToGaiaRelaying|TestGaiaToGaiaRelaying|TestUnorderedChannelBlockHeightTimeout|TestUnorderedChannelTimestampTimeout' ./_test
+interchaintest-docker:
+	cd interchaintest && go test -race -v -run TestRelayerDocker .
 
-test-akash:
-	@go test -mod=readonly -v -run TestAkashToGaiaRelaying ./_test/
+interchaintest-docker-events:
+	cd interchaintest && go test -race -v -run TestRelayerDockerEventProcessor .
 
-test-short:
-	@go test -mod=readonly -v -run TestOsmoToGaiaRelaying ./_test/
+interchaintest-docker-legacy:
+	cd interchaintest && go test -race -v -run TestRelayerDockerLegacyProcessor .
 
-ibctest:
-	cd ibctest && go test -race -v -run TestRelayerInProcess .
+interchaintest-events:
+	cd interchaintest && go test -race -v -run TestRelayerEventProcessor .
 
-ibctest-docker:
-	cd ibctest && go test -race -v -run TestRelayerDocker .
+interchaintest-legacy:
+	cd interchaintest && go test -race -v -run TestRelayerLegacyProcessor .
 
-ibctest-docker-events:
-	cd ibctest && go test -race -v -run TestRelayerDockerEventProcessor .
+interchaintest-multiple:
+	cd interchaintest && go test -race -v -run TestRelayerMultiplePathsSingleProcess .
 
-ibctest-docker-legacy:
-	cd ibctest && go test -race -v -run TestRelayerDockerLegacyProcessor .
+interchaintest-misbehaviour:
+	cd interchaintest && go test -race -v -run TestRelayerMisbehaviourDetection .
+
+interchaintest-fee-middleware:
+	cd interchaintest && go test -race -v -run TestRelayerFeeMiddleware .
+
+interchaintest-fee-grant:
+	cd interchaintest && go test -race -v -run TestRelayerFeeGrant .
+
+interchaintest-scenario: ## Scenario tests are suitable for simple networks of 1 validator and no full nodes. They test specific functionality.
+	cd interchaintest && go test -timeout 30m -race -v -run TestScenario ./...
 
 coverage:
 	@echo "viewing test coverage..."
@@ -91,33 +107,76 @@ lint:
 # Chain Code Downloads
 ###############################################################################
 
+CHAIN_CODE := ./chain-code
+GAIA_REPO := $(CHAIN_CODE)/gaia
+
 get-gaia:
-	@mkdir -p ./chain-code/
-	@git clone --branch $(GAIA_VERSION) --depth=1 https://github.com/cosmos/gaia.git ./chain-code/gaia
+	@mkdir -p $(CHAIN_CODE)/
+	@git clone --branch $(GAIA_VERSION) --depth=1 https://github.com/cosmos/gaia.git $(GAIA_REPO)
 
 build-gaia:
-	@./scripts/build-gaia
+	@[ -d $(GAIA_REPO) ] || { echo "Repositry for gaia does not exist at $(GAIA_REPO). Try running 'make get-gaia'..." ; exit 1; }
+	@cd $(GAIA_REPO) && \
+	make install &> /dev/null
+	@gaiad version --long
 
-build-akash:
-	@./scripts/build-akash
+.PHONY: two-chains test test-integration interchaintest install build lint coverage clean
 
-get-akash:
-	@mkdir -p ./chain-code/
-	@git clone --branch $(AKASH_VERSION) git@github.com:ovrclk/akash.git ./chain-code/akash
+PACKAGE_NAME          := github.com/cosmos/relayer
+GOLANG_CROSS_VERSION  ?= v1.19.4
 
-get-chains: get-gaia get-akash get-wasmd
+SYSROOT_DIR     ?= sysroots
+SYSROOT_ARCHIVE ?= sysroots.tar.bz2
 
-get-wasmd:
-	@mkdir -p ./chain-code/
-	@git clone --branch $(WASMD_VERSION) git@github.com:CosmWasm/wasmd.git ./chain-code/wasmd
+.PHONY: sysroot-pack
+sysroot-pack:
+	@tar cf - $(SYSROOT_DIR) -P | pv -s $[$(du -sk $(SYSROOT_DIR) | awk '{print $1}') * 1024] | pbzip2 > $(SYSROOT_ARCHIVE)
 
-build-wasmd:
-	@./scripts/build-wasmd
+.PHONY: sysroot-unpack
+sysroot-unpack:
+	@pv $(SYSROOT_ARCHIVE) | pbzip2 -cd | tar -xf -
 
-build-chains: build-akash build-gaia build-wasmd
+.PHONY: release-dry-run
+release-dry-run:
+	@docker run \
+		--rm \
+		-e CGO_ENABLED=1 \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v `pwd`:/go/src/$(PACKAGE_NAME) \
+		-v `pwd`/sysroot:/sysroot \
+		-w /go/src/$(PACKAGE_NAME) \
+		goreleaser/goreleaser-cross:${GOLANG_CROSS_VERSION} \
+		--rm-dist --skip-validate --skip-publish
 
-delete-chains: 
-	@echo "Removing the ./chain-code/ directory..."
-	@rm -rf ./chain-code
+.PHONY: release
+release:
+	@if [ ! -f ".release-env" ]; then \
+		echo "\033[91m.release-env is required for release\033[0m";\
+		exit 1;\
+	fi
+	docker run \
+		--rm \
+		-e CGO_ENABLED=1 \
+		--env-file .release-env \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v `pwd`:/go/src/$(PACKAGE_NAME) \
+		-v `pwd`/sysroot:/sysroot \
+		-w /go/src/$(PACKAGE_NAME) \
+		goreleaser/goreleaser-cross:${GOLANG_CROSS_VERSION} \
+		release --rm-dist
 
-.PHONY: two-chains test test-integration ibctest install build lint coverage clean
+protoVer=0.11.2
+protoImageName=ghcr.io/cosmos/proto-builder:$(protoVer)
+protoImage=$(DOCKER) run --rm -v $(CURDIR):/workspace --workdir /workspace $(protoImageName)
+
+proto-all: proto-format proto-lint proto-gen
+
+proto-gen:
+	@echo "Generating Protobuf files"
+	@$(protoImage) sh ./scripts/protocgen.sh
+
+proto-format:
+	@$(protoImage) find ./ -name "*.proto" -exec clang-format -i {} \;
+
+proto-lint:
+	@$(protoImage) buf lint --error-format=json

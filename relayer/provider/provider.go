@@ -5,20 +5,32 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cometbft/cometbft/proto/tendermint/crypto"
+	"github.com/cometbft/cometbft/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
-	transfertypes "github.com/cosmos/ibc-go/v4/modules/apps/transfer/types"
-	clienttypes "github.com/cosmos/ibc-go/v4/modules/core/02-client/types"
-	conntypes "github.com/cosmos/ibc-go/v4/modules/core/03-connection/types"
-	chantypes "github.com/cosmos/ibc-go/v4/modules/core/04-channel/types"
-	ibcexported "github.com/cosmos/ibc-go/v4/modules/core/exported"
-	"github.com/gogo/protobuf/proto"
+	"github.com/cosmos/gogoproto/proto"
+	transfertypes "github.com/cosmos/ibc-go/v7/modules/apps/transfer/types"
+	clienttypes "github.com/cosmos/ibc-go/v7/modules/core/02-client/types"
+	conntypes "github.com/cosmos/ibc-go/v7/modules/core/03-connection/types"
+	chantypes "github.com/cosmos/ibc-go/v7/modules/core/04-channel/types"
+	commitmenttypes "github.com/cosmos/ibc-go/v7/modules/core/23-commitment/types"
+	ibcexported "github.com/cosmos/ibc-go/v7/modules/core/exported"
+	tendermint "github.com/cosmos/ibc-go/v7/modules/light-clients/07-tendermint"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+)
+
+type BroadcastMode string
+
+const (
+	BroadcastModeSingle BroadcastMode = "single"
+	BroadcastModeBatch  BroadcastMode = "batch"
 )
 
 type ProviderConfig interface {
 	NewProvider(log *zap.Logger, homepath string, debug bool, chainName string) (ChainProvider, error)
 	Validate() error
+	BroadcastMode() BroadcastMode
 }
 
 type RelayerMessage interface {
@@ -27,11 +39,12 @@ type RelayerMessage interface {
 }
 
 type RelayerTxResponse struct {
-	Height int64
-	TxHash string
-	Code   uint32
-	Data   string
-	Events []RelayerEvent
+	Height    int64
+	TxHash    string
+	Codespace string
+	Code      uint32
+	Data      string
+	Events    []RelayerEvent
 }
 
 type RelayerEvent struct {
@@ -45,14 +58,18 @@ type LatestBlock struct {
 }
 
 type IBCHeader interface {
-	IBCHeaderIndicator()
 	Height() uint64
+	ConsensusState() ibcexported.ConsensusState
+	NextValidatorsHash() []byte
 }
 
 // ClientState holds the current state of a client from a single chain's perspective
 type ClientState struct {
 	ClientID        string
 	ConsensusHeight clienttypes.Height
+	TrustingPeriod  time.Duration
+	ConsensusTime   time.Time
+	Header          []byte
 }
 
 // ClientTrustedState holds the current state of a client from the perspective of both involved chains,
@@ -94,11 +111,12 @@ func (pi PacketInfo) Packet() chantypes.Packet {
 // ConnectionInfo contains relevant properties from connection handshake messages
 // which may be necessary to construct the next message for the counterparty chain.
 type ConnectionInfo struct {
-	Height               uint64
-	ConnID               string
-	ClientID             string
-	CounterpartyClientID string
-	CounterpartyConnID   string
+	Height                       uint64
+	ConnID                       string
+	ClientID                     string
+	CounterpartyClientID         string
+	CounterpartyConnID           string
+	CounterpartyCommitmentPrefix commitmenttypes.MerklePrefix
 }
 
 // ChannelInfo contains relevant properties from channel handshake messages
@@ -117,6 +135,21 @@ type ChannelInfo struct {
 
 	Order   chantypes.Order
 	Version string
+}
+
+// ClientICQQueryID string wrapper for query ID.
+type ClientICQQueryID string
+
+// ClientICQInfo contains relevant properties from client ICQ messages.
+// Client ICQ implementation does not use IBC connections and channels.
+type ClientICQInfo struct {
+	Source     string
+	Connection string
+	Chain      string
+	QueryID    ClientICQQueryID
+	Type       string
+	Request    []byte
+	Height     uint64
 }
 
 // PacketProof includes all of the proof parameters needed for packet flows.
@@ -139,6 +172,12 @@ type ChannelProof struct {
 	ProofHeight clienttypes.Height
 	Ordering    chantypes.Order
 	Version     string
+}
+
+type ICQProof struct {
+	Result   []byte
+	ProofOps *crypto.ProofOps // TODO swap out tendermint type for third party chains.
+	Height   int64
 }
 
 // loggableEvents is an unexported wrapper type for a slice of RelayerEvent,
@@ -166,6 +205,7 @@ func (es loggableEvents) MarshalLogArray(enc zapcore.ArrayEncoder) error {
 func (r RelayerTxResponse) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 	enc.AddInt64("height", r.Height)
 	enc.AddString("tx_hash", r.TxHash)
+	enc.AddString("codespace", r.Codespace)
 	enc.AddUint32("code", r.Code)
 	enc.AddString("data", r.Data)
 	enc.AddArray("events", loggableEvents(r.Events))
@@ -175,8 +215,9 @@ func (r RelayerTxResponse) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 type KeyProvider interface {
 	CreateKeystore(path string) error
 	KeystoreCreated(path string) bool
-	AddKey(name string, coinType uint32) (output *KeyOutput, err error)
-	RestoreKey(name, mnemonic string, coinType uint32) (address string, err error)
+	AddKey(name string, coinType uint32, signingAlgorithm string) (output *KeyOutput, err error)
+	UseKey(key string) error
+	RestoreKey(name, mnemonic string, coinType uint32, signingAlgorithm string) (address string, err error)
 	ShowAddress(name string) (address string, err error)
 	ListAddresses() (map[string]string, error)
 	DeleteKey(name string) error
@@ -188,9 +229,18 @@ type ChainProvider interface {
 	QueryProvider
 	KeyProvider
 
-	Init() error
-	CreateClient(clientState ibcexported.ClientState, dstHeader ibcexported.Header, signer string) (RelayerMessage, error)
-	SubmitMisbehavior( /*TODO TBD*/ ) (RelayerMessage, error)
+	Init(ctx context.Context) error
+
+	// [Begin] Client IBC message assembly functions
+	NewClientState(dstChainID string, dstIBCHeader IBCHeader, dstTrustingPeriod, dstUbdPeriod time.Duration, allowUpdateAfterExpiry, allowUpdateAfterMisbehaviour bool) (ibcexported.ClientState, error)
+
+	MsgCreateClient(clientState ibcexported.ClientState, consensusState ibcexported.ConsensusState) (RelayerMessage, error)
+
+	MsgUpgradeClient(srcClientId string, consRes *clienttypes.QueryConsensusStateResponse, clientRes *clienttypes.QueryClientStateResponse) (RelayerMessage, error)
+
+	MsgSubmitMisbehaviour(clientID string, misbehaviour ibcexported.ClientMessage) (RelayerMessage, error)
+
+	// [End] Client IBC message assembly functions
 
 	// ValidatePacket makes sure packet is valid to be relayed.
 	// It should return TimeoutHeightError, TimeoutTimestampError, or TimeoutOnCloseError
@@ -239,6 +289,9 @@ type ChainProvider interface {
 	// and assembles a full MsgTimeoutOnClose ready to write to the chain,
 	// i.e. the chain where the MsgTransfer was committed.
 	MsgTimeoutOnClose(msgTransfer PacketInfo, proofUnreceived PacketProof) (RelayerMessage, error)
+
+	// Get the commitment prefix of the chain.
+	CommitmentPrefix() commitmenttypes.MerklePrefix
 
 	// [End] Packet flow IBC message assembly
 
@@ -306,32 +359,43 @@ type ChainProvider interface {
 
 	// MsgUpdateClientHeader takes the latest chain header, in addition to the latest client trusted header
 	// and assembles a new header for updating the light client on the counterparty chain.
-	MsgUpdateClientHeader(latestHeader IBCHeader, trustedHeight clienttypes.Height, trustedHeader IBCHeader) (ibcexported.Header, error)
+	MsgUpdateClientHeader(latestHeader IBCHeader, trustedHeight clienttypes.Height, trustedHeader IBCHeader) (ibcexported.ClientMessage, error)
 
 	// MsgUpdateClient takes an update client header to prove trust for the previous
 	// consensus height and the new height, and assembles a MsgUpdateClient message
 	// formatted for this chain.
-	MsgUpdateClient(clientId string, counterpartyHeader ibcexported.Header) (RelayerMessage, error)
+	MsgUpdateClient(clientID string, counterpartyHeader ibcexported.ClientMessage) (RelayerMessage, error)
 
 	// [End] Client IBC message assembly
 
-	// TODO remove these message assembly functions in favor of the above.
-	MsgRelayAcknowledgement(ctx context.Context, dst ChainProvider, dstChanId, dstPortId, srcChanId, srcPortId string, dsth int64, packet RelayPacket) (RelayerMessage, error)
-	MsgRelayTimeout(ctx context.Context, dst ChainProvider, dsth int64, packet RelayPacket, dstChanId, dstPortId, srcChanId, srcPortId string, order chantypes.Order) (RelayerMessage, error)
-	MsgRelayRecvPacket(ctx context.Context, dst ChainProvider, dsth int64, packet RelayPacket, dstChanId, dstPortId, srcChanId, srcPortId string) (RelayerMessage, error)
-	MsgUpgradeClient(srcClientId string, consRes *clienttypes.QueryConsensusStateResponse, clientRes *clienttypes.QueryClientStateResponse) (RelayerMessage, error)
-	RelayPacketFromSequence(ctx context.Context, src, dst ChainProvider, srch, dsth, seq uint64, dstChanId, dstPortId, dstClientId, srcChanId, srcPortId, srcClientId string, order chantypes.Order) (RelayerMessage, RelayerMessage, error)
-	AcknowledgementFromSequence(ctx context.Context, dst ChainProvider, dsth, seq uint64, dstChanId, dstPortId, srcChanId, srcPortId string) (RelayerMessage, error)
+	// [Begin] Client ICQ message assembly
+
+	// QueryICQWithProof performs an ABCI query and includes the required proofOps.
+	QueryICQWithProof(ctx context.Context, msgType string, request []byte, height uint64) (ICQProof, error)
+
+	// MsgSubmitQueryResponse takes the counterparty chain ID, the ICQ query ID, and the query result proof,
+	// then assembles a MsgSubmitQueryResponse message formatted for sending to this chain.
+	MsgSubmitQueryResponse(chainID string, queryID ClientICQQueryID, proof ICQProof) (RelayerMessage, error)
+
+	// [End] Client ICQ message assembly
+
+	// Query heavy relay methods. Only used for flushing old packets.
+
+	RelayPacketFromSequence(ctx context.Context, src ChainProvider, srch, dsth, seq uint64, srcChanID, srcPortID string, order chantypes.Order) (RelayerMessage, RelayerMessage, error)
+	AcknowledgementFromSequence(ctx context.Context, dst ChainProvider, dsth, seq uint64, dstChanID, dstPortID, srcChanID, srcPortID string) (RelayerMessage, error)
 
 	SendMessage(ctx context.Context, msg RelayerMessage, memo string) (*RelayerTxResponse, bool, error)
 	SendMessages(ctx context.Context, msgs []RelayerMessage, memo string) (*RelayerTxResponse, bool, error)
+	SendMessagesToMempool(
+		ctx context.Context,
+		msgs []RelayerMessage,
+		memo string,
 
-	// TODO consolidate with IBCHeaderAtHeight
-	GetLightSignedHeaderAtHeight(ctx context.Context, h int64) (ibcexported.Header, error)
-	GetIBCUpdateHeader(ctx context.Context, srch int64, dst ChainProvider, dstClientId string) (ibcexported.Header, error)
+		asyncCtx context.Context,
+		asyncCallbacks []func(*RelayerTxResponse, error),
+	) error
 
-	// IBCHeaderAtHeight returns the IBC compatible block header at a specific height.
-	IBCHeaderAtHeight(ctx context.Context, h int64) (IBCHeader, error)
+	MsgRegisterCounterpartyPayee(portID, channelID, relayerAddr, counterpartyPayeeAddr string) (RelayerMessage, error)
 
 	ChainName() string
 	ChainId() string
@@ -343,16 +407,24 @@ type ChainProvider interface {
 	TrustingPeriod(ctx context.Context) (time.Duration, error)
 	WaitForNBlocks(ctx context.Context, n int64) error
 	Sprint(toPrint proto.Message) (string, error)
+
+	SetRpcAddr(rpcAddr string) error
 }
 
 // Do we need intermediate types? i.e. can we use the SDK types for both substrate and cosmos?
 type QueryProvider interface {
 	// chain
-	BlockTime(ctx context.Context, height int64) (int64, error)
+	BlockTime(ctx context.Context, height int64) (time.Time, error)
 	QueryTx(ctx context.Context, hashHex string) (*RelayerTxResponse, error)
 	QueryTxs(ctx context.Context, page, limit int, events []string) ([]*RelayerTxResponse, error)
 	QueryLatestHeight(ctx context.Context) (int64, error)
-	QueryHeaderAtHeight(ctx context.Context, height int64) (ibcexported.Header, error)
+
+	// QueryIBCHeader returns the IBC compatible block header at a specific height.
+	QueryIBCHeader(ctx context.Context, h int64) (IBCHeader, error)
+
+	// query packet info for sequence
+	QuerySendPacket(ctx context.Context, srcChanID, srcPortID string, sequence uint64) (PacketInfo, error)
+	QueryRecvPacket(ctx context.Context, dstChanID, dstPortID string, sequence uint64) (PacketInfo, error)
 
 	// bank
 	QueryBalance(ctx context.Context, keyName string) (sdk.Coins, error)
@@ -377,7 +449,6 @@ type QueryProvider interface {
 	GenerateConnHandshakeProof(ctx context.Context, height int64, clientId, connId string) (clientState ibcexported.ClientState,
 		clientStateProof []byte, consensusProof []byte, connectionProof []byte,
 		connectionProofHeight ibcexported.Height, err error)
-	NewClientState(dstUpdateHeader ibcexported.Header, dstTrustingPeriod, dstUbdPeriod time.Duration, allowUpdateAfterExpiry, allowUpdateAfterMisbehaviour bool) (ibcexported.ClientState, error)
 
 	// ics 04 - channel
 	QueryChannel(ctx context.Context, height int64, channelid, portid string) (chanRes *chantypes.QueryChannelResponse, err error)
@@ -389,6 +460,7 @@ type QueryProvider interface {
 	QueryUnreceivedPackets(ctx context.Context, height uint64, channelid, portid string, seqs []uint64) ([]uint64, error)
 	QueryUnreceivedAcknowledgements(ctx context.Context, height uint64, channelid, portid string, seqs []uint64) ([]uint64, error)
 	QueryNextSeqRecv(ctx context.Context, height int64, channelid, portid string) (recvRes *chantypes.QueryNextSequenceReceiveResponse, err error)
+	QueryNextSeqAck(ctx context.Context, height int64, channelid, portid string) (recvRes *chantypes.QueryNextSequenceReceiveResponse, err error)
 	QueryPacketCommitment(ctx context.Context, height int64, channelid, portid string, seq uint64) (comRes *chantypes.QueryPacketCommitmentResponse, err error)
 	QueryPacketAcknowledgement(ctx context.Context, height int64, channelid, portid string, seq uint64) (ackRes *chantypes.QueryPacketAcknowledgementResponse, err error)
 	QueryPacketReceipt(ctx context.Context, height int64, channelid, portid string, seq uint64) (recRes *chantypes.QueryPacketReceiptResponse, err error)
@@ -454,4 +526,51 @@ func (t *TimeoutOnCloseError) Error() string {
 
 func NewTimeoutOnCloseError(msg string) *TimeoutOnCloseError {
 	return &TimeoutOnCloseError{msg}
+}
+
+type TendermintIBCHeader struct {
+	SignedHeader      *types.SignedHeader
+	ValidatorSet      *types.ValidatorSet
+	TrustedValidators *types.ValidatorSet
+	TrustedHeight     clienttypes.Height
+}
+
+func (h TendermintIBCHeader) Height() uint64 {
+	return uint64(h.SignedHeader.Height)
+}
+
+func (h TendermintIBCHeader) ConsensusState() ibcexported.ConsensusState {
+	return &tendermint.ConsensusState{
+		Timestamp:          h.SignedHeader.Time,
+		Root:               commitmenttypes.NewMerkleRoot(h.SignedHeader.AppHash),
+		NextValidatorsHash: h.SignedHeader.NextValidatorsHash,
+	}
+}
+
+func (h TendermintIBCHeader) NextValidatorsHash() []byte {
+	return h.SignedHeader.NextValidatorsHash
+}
+
+func (h TendermintIBCHeader) TMHeader() (*tendermint.Header, error) {
+	valSet, err := h.ValidatorSet.ToProto()
+	if err != nil {
+		return nil, err
+	}
+
+	trustedVals, err := h.TrustedValidators.ToProto()
+	if err != nil {
+		return nil, err
+	}
+
+	return &tendermint.Header{
+		SignedHeader:      h.SignedHeader.ToProto(),
+		ValidatorSet:      valSet,
+		TrustedHeight:     h.TrustedHeight,
+		TrustedValidators: trustedVals,
+	}, nil
+}
+
+type ExtensionOption struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
 }
